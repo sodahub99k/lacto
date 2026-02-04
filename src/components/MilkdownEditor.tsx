@@ -6,7 +6,18 @@ import { listener, listenerCtx } from "@milkdown/kit/plugin/listener";
 import { nord } from "@milkdown/theme-nord";
 import { replaceAll } from "@milkdown/utils";
 import { editorViewCtx } from "@milkdown/core";
-import type { EditorView } from "@milkdown/prose/view";
+
+type ProseLikeDoc = {
+  descendants: (fn: (node: any, pos: number) => void) => void;
+  forEach: (fn: (node: any, offset: number) => void) => void;
+};
+
+type ProseLikeView = {
+  state: {
+    doc: ProseLikeDoc;
+  };
+  coordsAtPos: (pos: number) => { top: number };
+};
 
 import "@milkdown/theme-nord/style.css";
 
@@ -25,33 +36,14 @@ type Stops = {
 const clamp = (value: number, min: number, max: number) =>
   Math.min(max, Math.max(min, value));
 
-const easeOutQuad = (t: number) => 1 - (1 - t) * (1 - t);
+type PendingScroll = {
+  el: HTMLElement;
+  target: number;
+};
 
-const smoothScrollTo = (
-  el: HTMLElement,
-  target: number,
-  cancelRef: React.MutableRefObject<number | null>,
-  durationMs = 120,
-) => {
-  if (cancelRef.current != null) {
-    cancelAnimationFrame(cancelRef.current);
-    cancelRef.current = null;
-  }
-
-  const start = el.scrollTop;
-  const delta = target - start;
-  if (Math.abs(delta) < 0.5) return;
-
-  const startAt = performance.now();
-
-  const step = (now: number) => {
-    const p = clamp((now - startAt) / durationMs, 0, 1);
-    const e = easeOutQuad(p);
-    el.scrollTop = start + delta * e;
-    if (p < 1) cancelRef.current = requestAnimationFrame(step);
-  };
-
-  cancelRef.current = requestAnimationFrame(step);
+type PendingScrolls = {
+  source?: PendingScroll;
+  editor?: PendingScroll;
 };
 
 const resampleStops = (stops: number[], nextLen: number): number[] => {
@@ -144,10 +136,11 @@ const InnerEditor: React.FC<Props> = ({
   const stopsRef = useRef<Stops>({ sourceStops: [], editorStops: [] });
   const recomputeRafRef = useRef<number | null>(null);
 
+  const pendingScrollsRef = useRef<PendingScrolls>({});
+  const syncRafRef = useRef<number | null>(null);
+
   const syncLockRef = useRef<"source" | "editor" | null>(null);
   const syncLockUntilRef = useRef(0);
-  const sourceAnimRef = useRef<number | null>(null);
-  const editorAnimRef = useRef<number | null>(null);
 
   const markdownRef = useRef(markdown);
   useEffect(() => {
@@ -189,11 +182,11 @@ const InnerEditor: React.FC<Props> = ({
 
   const { get } = useEditor(editorFactory);
 
-  const getEditorView = (): EditorView | null => {
+  const getEditorView = (): ProseLikeView | null => {
     const editor = get();
     if (!editor) return null;
     try {
-      return editor.action((ctx) => ctx.get(editorViewCtx)) as EditorView;
+      return editor.action((ctx) => ctx.get(editorViewCtx)) as ProseLikeView;
     } catch {
       return null;
     }
@@ -232,7 +225,7 @@ const InnerEditor: React.FC<Props> = ({
     const editorScrollTop = editorScrollEl.scrollTop;
 
     const editorHeadingStops: number[] = [];
-    view.state.doc.descendants((node, pos) => {
+    view.state.doc.descendants((node: any, pos: number) => {
       if (node.type.name !== "heading") return;
       try {
         const coords = view.coordsAtPos(pos + 1);
@@ -244,7 +237,7 @@ const InnerEditor: React.FC<Props> = ({
     });
 
     const editorBlockStops: number[] = [];
-    view.state.doc.forEach((_node, offset) => {
+    view.state.doc.forEach((_node: any, offset: number) => {
       try {
         const coords = view.coordsAtPos(offset + 1);
         const top = coords.top - editorRect.top + editorScrollTop;
@@ -327,9 +320,9 @@ const InnerEditor: React.FC<Props> = ({
     return () => ro.disconnect();
   }, []);
 
-  const acquireLock = (who: "source" | "editor") => {
+  const acquireLock = (who: "source" | "editor", ms = 240) => {
     syncLockRef.current = who;
-    syncLockUntilRef.current = performance.now() + 120;
+    syncLockUntilRef.current = performance.now() + ms;
   };
 
   const isLockedByOther = (who: "source" | "editor") => {
@@ -341,6 +334,30 @@ const InnerEditor: React.FC<Props> = ({
       return false;
     }
     return locked !== who;
+  };
+
+  const scheduleScrollTop = (
+    key: "source" | "editor",
+    el: HTMLElement,
+    target: number,
+  ) => {
+    pendingScrollsRef.current[key] = { el, target };
+    if (syncRafRef.current != null) return;
+    syncRafRef.current = requestAnimationFrame(() => {
+      syncRafRef.current = null;
+      const pending = pendingScrollsRef.current;
+      pendingScrollsRef.current = {};
+
+      const apply = (p?: PendingScroll) => {
+        if (!p) return;
+        const max = Math.max(0, p.el.scrollHeight - p.el.clientHeight);
+        const next = clamp(p.target, 0, max);
+        if (Math.abs(p.el.scrollTop - next) > 0.5) p.el.scrollTop = next;
+      };
+
+      apply(pending.source);
+      apply(pending.editor);
+    });
   };
 
   const syncSourceToEditor = () => {
@@ -361,8 +378,8 @@ const InnerEditor: React.FC<Props> = ({
       editorMax,
     );
 
-    acquireLock("source");
-    smoothScrollTo(editorEl, target, editorAnimRef, 140);
+    acquireLock("source", 260);
+    scheduleScrollTop("editor", editorEl, target);
   };
 
   const syncEditorToSource = () => {
@@ -383,8 +400,8 @@ const InnerEditor: React.FC<Props> = ({
       sourceMax,
     );
 
-    acquireLock("editor");
-    smoothScrollTo(sourceEl, target, sourceAnimRef, 140);
+    acquireLock("editor", 260);
+    scheduleScrollTop("source", sourceEl, target);
   };
 
   return (

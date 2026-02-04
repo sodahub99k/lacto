@@ -36,6 +36,37 @@ type Stops = {
 const clamp = (value: number, min: number, max: number) =>
   Math.min(max, Math.max(min, value));
 
+const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3);
+
+const smoothScrollTo = (
+  el: HTMLElement,
+  target: number,
+  cancelRef: React.MutableRefObject<number | null>,
+  durationMs = 140,
+) => {
+  if (cancelRef.current != null) {
+    cancelAnimationFrame(cancelRef.current);
+    cancelRef.current = null;
+  }
+
+  const max = Math.max(0, el.scrollHeight - el.clientHeight);
+  const to = clamp(target, 0, max);
+  const start = el.scrollTop;
+  const delta = to - start;
+  if (Math.abs(delta) < 0.5) return;
+
+  const startAt = performance.now();
+
+  const step = (now: number) => {
+    const p = clamp((now - startAt) / durationMs, 0, 1);
+    const e = easeOutCubic(p);
+    el.scrollTop = start + delta * e;
+    if (p < 1) cancelRef.current = requestAnimationFrame(step);
+  };
+
+  cancelRef.current = requestAnimationFrame(step);
+};
+
 type PendingScroll = {
   el: HTMLElement;
   target: number;
@@ -141,6 +172,11 @@ const InnerEditor: React.FC<Props> = ({
 
   const syncLockRef = useRef<"source" | "editor" | null>(null);
   const syncLockUntilRef = useRef(0);
+
+  const sourceSnapTimerRef = useRef<number | null>(null);
+  const editorSnapTimerRef = useRef<number | null>(null);
+  const sourceSnapAnimRef = useRef<number | null>(null);
+  const editorSnapAnimRef = useRef<number | null>(null);
 
   const markdownRef = useRef(markdown);
   useEffect(() => {
@@ -360,6 +396,74 @@ const InnerEditor: React.FC<Props> = ({
     });
   };
 
+  const clearSnapTimers = () => {
+    if (sourceSnapTimerRef.current != null) {
+      window.clearTimeout(sourceSnapTimerRef.current);
+      sourceSnapTimerRef.current = null;
+    }
+    if (editorSnapTimerRef.current != null) {
+      window.clearTimeout(editorSnapTimerRef.current);
+      editorSnapTimerRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      clearSnapTimers();
+      if (sourceSnapAnimRef.current != null)
+        cancelAnimationFrame(sourceSnapAnimRef.current);
+      if (editorSnapAnimRef.current != null)
+        cancelAnimationFrame(editorSnapAnimRef.current);
+    };
+  }, []);
+
+  const scheduleSnap = (who: "source" | "editor") => {
+    const timerRef = who === "source" ? sourceSnapTimerRef : editorSnapTimerRef;
+
+    if (timerRef.current != null) window.clearTimeout(timerRef.current);
+
+    timerRef.current = window.setTimeout(() => {
+      timerRef.current = null;
+      if (isLockedByOther(who)) return;
+
+      const sourceEl = sourceRef.current;
+      const editorEl = wysiwygScrollRef.current;
+      if (!sourceEl || !editorEl) return;
+
+      const sourceMax = Math.max(
+        0,
+        sourceEl.scrollHeight - sourceEl.clientHeight,
+      );
+      const editorMax = Math.max(
+        0,
+        editorEl.scrollHeight - editorEl.clientHeight,
+      );
+      const { sourceStops, editorStops } = stopsRef.current;
+
+      if (who === "source") {
+        const target = mapScrollTop(
+          sourceEl.scrollTop,
+          sourceStops,
+          editorStops,
+          sourceMax,
+          editorMax,
+        );
+        acquireLock("source", 360);
+        smoothScrollTo(editorEl, target, editorSnapAnimRef, 160);
+      } else {
+        const target = mapScrollTop(
+          editorEl.scrollTop,
+          editorStops,
+          sourceStops,
+          editorMax,
+          sourceMax,
+        );
+        acquireLock("editor", 360);
+        smoothScrollTo(sourceEl, target, sourceSnapAnimRef, 160);
+      }
+    }, 120);
+  };
+
   const syncSourceToEditor = () => {
     if (isLockedByOther("source")) return;
     const sourceEl = sourceRef.current;
@@ -380,6 +484,7 @@ const InnerEditor: React.FC<Props> = ({
 
     acquireLock("source", 260);
     scheduleScrollTop("editor", editorEl, target);
+    scheduleSnap("source");
   };
 
   const syncEditorToSource = () => {
@@ -402,6 +507,7 @@ const InnerEditor: React.FC<Props> = ({
 
     acquireLock("editor", 260);
     scheduleScrollTop("source", sourceEl, target);
+    scheduleSnap("editor");
   };
 
   return (

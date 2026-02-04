@@ -5,6 +5,8 @@ import { commonmark } from "@milkdown/kit/preset/commonmark";
 import { listener, listenerCtx } from "@milkdown/kit/plugin/listener";
 import { nord } from "@milkdown/theme-nord";
 import { replaceAll } from "@milkdown/utils";
+import { editorViewCtx } from "@milkdown/core";
+import type { EditorView } from "@milkdown/prose/view";
 
 import "@milkdown/theme-nord/style.css";
 
@@ -15,6 +17,119 @@ type Props = {
   debounceMs?: number;
 };
 
+type Stops = {
+  sourceStops: number[];
+  editorStops: number[];
+};
+
+const clamp = (value: number, min: number, max: number) =>
+  Math.min(max, Math.max(min, value));
+
+const easeOutQuad = (t: number) => 1 - (1 - t) * (1 - t);
+
+const smoothScrollTo = (
+  el: HTMLElement,
+  target: number,
+  cancelRef: React.MutableRefObject<number | null>,
+  durationMs = 120,
+) => {
+  if (cancelRef.current != null) {
+    cancelAnimationFrame(cancelRef.current);
+    cancelRef.current = null;
+  }
+
+  const start = el.scrollTop;
+  const delta = target - start;
+  if (Math.abs(delta) < 0.5) return;
+
+  const startAt = performance.now();
+
+  const step = (now: number) => {
+    const p = clamp((now - startAt) / durationMs, 0, 1);
+    const e = easeOutQuad(p);
+    el.scrollTop = start + delta * e;
+    if (p < 1) cancelRef.current = requestAnimationFrame(step);
+  };
+
+  cancelRef.current = requestAnimationFrame(step);
+};
+
+const resampleStops = (stops: number[], nextLen: number): number[] => {
+  if (nextLen <= 0) return [];
+  if (stops.length === nextLen) return stops;
+  if (stops.length === 0) return Array.from({ length: nextLen }, () => 0);
+  if (stops.length === 1)
+    return Array.from({ length: nextLen }, () => stops[0]);
+
+  const maxIndex = stops.length - 1;
+  return Array.from({ length: nextLen }, (_unused, j) => {
+    const f = nextLen === 1 ? 0 : j / (nextLen - 1);
+    const x = f * maxIndex;
+    const i = Math.floor(x);
+    const t = x - i;
+    const a = stops[i] ?? stops[maxIndex];
+    const b = stops[Math.min(i + 1, maxIndex)] ?? stops[maxIndex];
+    return a + (b - a) * t;
+  });
+};
+
+const mapScrollTop = (
+  fromTop: number,
+  fromStops: number[],
+  toStops: number[],
+  fromMax: number,
+  toMax: number,
+) => {
+  if (fromMax <= 0 || toMax <= 0) {
+    const ratio = fromMax <= 0 ? 0 : clamp(fromTop / fromMax, 0, 1);
+    return ratio * toMax;
+  }
+
+  const from = fromStops.length >= 2 ? fromStops : [0, fromMax];
+  const to = toStops.length >= 2 ? toStops : [0, toMax];
+  const len = Math.max(2, Math.min(from.length, to.length));
+  const fStops = resampleStops(from, len);
+  const tStops = resampleStops(to, len);
+
+  const top = clamp(fromTop, 0, fromMax);
+
+  let i = 0;
+  while (i < len - 2 && top > fStops[i + 1]) i++;
+
+  const a = fStops[i];
+  const b = fStops[i + 1];
+  const t = b === a ? 0 : clamp((top - a) / (b - a), 0, 1);
+  return tStops[i] + (tStops[i + 1] - tStops[i]) * t;
+};
+
+const getLineHeightPx = (el: HTMLTextAreaElement): number => {
+  const s = getComputedStyle(el);
+  const lh = parseFloat(s.lineHeight);
+  if (!Number.isFinite(lh)) return 20;
+  if (lh === 0) return 20;
+  return lh;
+};
+
+const extractHeadingLineStarts = (markdown: string): number[] => {
+  const lines = markdown.split("\n");
+  const starts: number[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (/^#{1,6}\s+/.test(lines[i] ?? "")) starts.push(i);
+  }
+  return starts;
+};
+
+const extractBlockLineStarts = (markdown: string): number[] => {
+  const lines = markdown.split("\n");
+  const starts: number[] = [0];
+  for (let i = 1; i < lines.length; i++) {
+    const prev = (lines[i - 1] ?? "").trim();
+    const cur = (lines[i] ?? "").trim();
+    if (prev === "" && cur !== "") starts.push(i);
+  }
+  return Array.from(new Set(starts)).sort((a, b) => a - b);
+};
+
 const InnerEditor: React.FC<Props> = ({
   initialMarkdown = DEFAULT_MD,
   debounceMs = 250,
@@ -22,6 +137,17 @@ const InnerEditor: React.FC<Props> = ({
   const initial = useMemo(() => initialMarkdown, [initialMarkdown]);
 
   const [markdown, setMarkdown] = useState<string>(initial);
+
+  const sourceRef = useRef<HTMLTextAreaElement | null>(null);
+  const wysiwygScrollRef = useRef<HTMLDivElement | null>(null);
+
+  const stopsRef = useRef<Stops>({ sourceStops: [], editorStops: [] });
+  const recomputeRafRef = useRef<number | null>(null);
+
+  const syncLockRef = useRef<"source" | "editor" | null>(null);
+  const syncLockUntilRef = useRef(0);
+  const sourceAnimRef = useRef<number | null>(null);
+  const editorAnimRef = useRef<number | null>(null);
 
   const markdownRef = useRef(markdown);
   useEffect(() => {
@@ -47,6 +173,14 @@ const InnerEditor: React.FC<Props> = ({
 
             setMarkdown(nextMarkdown);
           });
+
+          ctx.get(listenerCtx).mounted(() => {
+            queueMicrotask(() => scheduleRecomputeStops());
+          });
+
+          ctx.get(listenerCtx).updated(() => {
+            scheduleRecomputeStops();
+          });
         })
         .use(commonmark)
         .use(listener);
@@ -54,6 +188,93 @@ const InnerEditor: React.FC<Props> = ({
   }, [initial]);
 
   const { get } = useEditor(editorFactory);
+
+  const getEditorView = (): EditorView | null => {
+    const editor = get();
+    if (!editor) return null;
+    try {
+      return editor.action((ctx) => ctx.get(editorViewCtx)) as EditorView;
+    } catch {
+      return null;
+    }
+  };
+
+  const recomputeStops = () => {
+    const sourceEl = sourceRef.current;
+    const editorScrollEl = wysiwygScrollRef.current;
+    const view = getEditorView();
+    if (!sourceEl || !editorScrollEl || !view) return;
+
+    const sourceMax = Math.max(0, sourceEl.scrollHeight - sourceEl.clientHeight);
+    const editorMax = Math.max(
+      0,
+      editorScrollEl.scrollHeight - editorScrollEl.clientHeight,
+    );
+
+    const lineHeight = getLineHeightPx(sourceEl);
+    const headingLines = extractHeadingLineStarts(markdownRef.current);
+    const blockLines = extractBlockLineStarts(markdownRef.current);
+    const sourceLines = headingLines.length >= 2 ? headingLines : blockLines;
+
+    const sourceStops = [
+      0,
+      ...sourceLines.map((line) => clamp(line * lineHeight, 0, sourceMax)),
+      sourceMax,
+    ]
+      .filter((x, idx, arr) => idx === 0 || x >= (arr[idx - 1] ?? 0))
+      .reduce<number[]>((acc, x) => {
+        if (acc.length === 0 || Math.abs(x - acc[acc.length - 1]!) > 0.5)
+          acc.push(x);
+        return acc;
+      }, []);
+
+    const editorRect = editorScrollEl.getBoundingClientRect();
+    const editorScrollTop = editorScrollEl.scrollTop;
+
+    const editorHeadingStops: number[] = [];
+    view.state.doc.descendants((node, pos) => {
+      if (node.type.name !== "heading") return;
+      try {
+        const coords = view.coordsAtPos(pos + 1);
+        const top = coords.top - editorRect.top + editorScrollTop;
+        editorHeadingStops.push(clamp(top, 0, editorMax));
+      } catch {
+        // ignore
+      }
+    });
+
+    const editorBlockStops: number[] = [];
+    view.state.doc.forEach((_node, offset) => {
+      try {
+        const coords = view.coordsAtPos(offset + 1);
+        const top = coords.top - editorRect.top + editorScrollTop;
+        editorBlockStops.push(clamp(top, 0, editorMax));
+      } catch {
+        // ignore
+      }
+    });
+
+    const editorAnchorsRaw =
+      editorHeadingStops.length >= 2 ? editorHeadingStops : editorBlockStops;
+
+    const editorStops = [0, ...editorAnchorsRaw, editorMax]
+      .sort((a, b) => a - b)
+      .reduce<number[]>((acc, x) => {
+        if (acc.length === 0 || Math.abs(x - acc[acc.length - 1]!) > 0.5)
+          acc.push(x);
+        return acc;
+      }, []);
+
+    stopsRef.current = { sourceStops, editorStops };
+  };
+
+  const scheduleRecomputeStops = () => {
+    if (recomputeRafRef.current != null) return;
+    recomputeRafRef.current = requestAnimationFrame(() => {
+      recomputeRafRef.current = null;
+      recomputeStops();
+    });
+  };
 
   useEffect(() => {
     const editor = get();
@@ -73,12 +294,98 @@ const InnerEditor: React.FC<Props> = ({
           applyingFromSourceRef.current = false;
         });
       }
+
+      scheduleRecomputeStops();
     }, debounceMs);
 
     return () => {
       window.clearTimeout(timer);
     };
   }, [debounceMs, get, markdown]);
+
+  useEffect(() => {
+    scheduleRecomputeStops();
+  }, [markdown]);
+
+  useEffect(() => {
+    const onResize = () => scheduleRecomputeStops();
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  useEffect(() => {
+    const sourceEl = sourceRef.current;
+    const editorEl = wysiwygScrollRef.current;
+    if (!sourceEl || !editorEl) return;
+
+    const ro = new ResizeObserver(() => {
+      scheduleRecomputeStops();
+    });
+    ro.observe(sourceEl);
+    ro.observe(editorEl);
+
+    return () => ro.disconnect();
+  }, []);
+
+  const acquireLock = (who: "source" | "editor") => {
+    syncLockRef.current = who;
+    syncLockUntilRef.current = performance.now() + 120;
+  };
+
+  const isLockedByOther = (who: "source" | "editor") => {
+    const locked = syncLockRef.current;
+    const until = syncLockUntilRef.current;
+    if (!locked) return false;
+    if (performance.now() > until) {
+      syncLockRef.current = null;
+      return false;
+    }
+    return locked !== who;
+  };
+
+  const syncSourceToEditor = () => {
+    if (isLockedByOther("source")) return;
+    const sourceEl = sourceRef.current;
+    const editorEl = wysiwygScrollRef.current;
+    if (!sourceEl || !editorEl) return;
+
+    const sourceMax = Math.max(0, sourceEl.scrollHeight - sourceEl.clientHeight);
+    const editorMax = Math.max(0, editorEl.scrollHeight - editorEl.clientHeight);
+    const { sourceStops, editorStops } = stopsRef.current;
+
+    const target = mapScrollTop(
+      sourceEl.scrollTop,
+      sourceStops,
+      editorStops,
+      sourceMax,
+      editorMax,
+    );
+
+    acquireLock("source");
+    smoothScrollTo(editorEl, target, editorAnimRef, 140);
+  };
+
+  const syncEditorToSource = () => {
+    if (isLockedByOther("editor")) return;
+    const sourceEl = sourceRef.current;
+    const editorEl = wysiwygScrollRef.current;
+    if (!sourceEl || !editorEl) return;
+
+    const sourceMax = Math.max(0, sourceEl.scrollHeight - sourceEl.clientHeight);
+    const editorMax = Math.max(0, editorEl.scrollHeight - editorEl.clientHeight);
+    const { sourceStops, editorStops } = stopsRef.current;
+
+    const target = mapScrollTop(
+      editorEl.scrollTop,
+      editorStops,
+      sourceStops,
+      editorMax,
+      sourceMax,
+    );
+
+    acquireLock("editor");
+    smoothScrollTo(sourceEl, target, sourceAnimRef, 140);
+  };
 
   return (
     <div className="split">
@@ -89,8 +396,10 @@ const InnerEditor: React.FC<Props> = ({
         <div className="pane-body">
           <textarea
             className="source"
+            ref={sourceRef}
             value={markdown}
             onChange={(e) => setMarkdown(e.currentTarget.value)}
+            onScroll={syncSourceToEditor}
             spellCheck={false}
           />
         </div>
@@ -100,7 +409,11 @@ const InnerEditor: React.FC<Props> = ({
         <div className="pane-header">
           <div className="pane-title">WYSIWYG</div>
         </div>
-        <div className="pane-body">
+        <div
+          className="pane-body"
+          ref={wysiwygScrollRef}
+          onScroll={syncEditorToSource}
+        >
           <div className="milkdown-shell">
             <Milkdown />
           </div>
